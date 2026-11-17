@@ -1,14 +1,21 @@
-# 垃圾邮件审核 · 模型版本固定 + 截止时间感知批处理
+# 垃圾邮件审核 · 模型版本固定 + 截止时间感知批处理 + 全局接单上限
 
 FastAPI + NumPy 的垃圾邮件审核运维控制台。网页可切换现行模型、并发提交至多 16 封邮件
 （每封独立 100–1000ms 截止时间），单工作器按 **模型版本** 组批推理，逐条展示分数、分类、
-模型版本与批次。
+模型版本与批次。全局最多同时接单 **8 封**：同步与异步提交共用名额，超出部分逐封标记为
+「过载拒单」且不进入模型队列。
 
 ## 核心契约
 
 | 需求 | 实现位置 |
 | --- | --- |
-| 排队邮件按「接单时」的版本分类 | 网关 `_run_job` 接单时快照 `active_version` 写入请求；工作器只读该字段 |
+| 全局最多接单 8 封（同步/异步共用） | `Worker.max_admitted`（`MAX_ADMITTED_EMAILS`，默认 8）；`Worker.admit()` 在接单瞬间同步判定 |
+| 逐封显示接单 / 过载 | 每个 `JobEntry` 的 `admission` + `status="rejected"`；网页「接单」列与任务头「拒单 N」 |
+| 拒单不进入模型队列 | 拒单发生在 `WorkItem` 入队之前，不建队列项、不占批次、无 `batch_id` |
+| 排队邮件到期释放名额 | 队列内定时器触发 `_finalize` → `_release_lease` |
+| 超时后打分仍在跑则继续占名额 | 打分包在独立 task 中，名额只在真实计算完成回调里释放；`timed_out_still_executing` 可观测 |
+| 已接单邮件仍按原模型与各自截止结算 | 版本在接单时快照；批内并发打分、逐封独立判定 |
+| 排队邮件按「接单时」的版本分类 | 网关 `_intake_entry` 接单时快照 `active_version` 写入请求；工作器只读该字段 |
 | 网页切换现行模型 | `POST /api/model` + 前端模型卡片 |
 | 并发提交 ≤16 封、每封 100–1000ms 截止 | `SubmitIn.emails`（`max_length=16` / `ge=100, le=1000`）|
 | 逐条查看分数/分类/版本/批次 | 结果表 + `GET /api/jobs/{id}` |
@@ -30,8 +37,8 @@ docker compose up --build
 ```
 
 镜像内已固定 `models/v1.json` 与 `models/v2.json` 两份不同的英文词袋线性模型，同时以只读卷
-挂载 `./models` 便于查看。Compose 只起 **一个** 副本、uvicorn 也只有 1 个 worker——批次调度
-与「现行模型」指针都是进程内状态。
+挂载 `./models` 便于查看。Compose 只起 **一个** 副本、uvicorn 也只有 1 个 worker——批次调度、
+接单名额与「现行模型」指针都是进程内状态。
 
 ### 本地运行
 
@@ -45,7 +52,7 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest -q                     # 21 项：调度语义 + 网关行为
+python3 -m pytest -q                     # 28 项：调度语义 + 接单上限 + 网关行为
 python3 scripts/selfcheck.py             # 对运行中的服务做端到端自测（默认 :8000）
 ```
 
@@ -70,10 +77,10 @@ NumPy，网关与测试结果逐位一致。
 | GET | `/healthz` | 健康检查 + 现行模型 |
 | GET | `/api/models` | 模型列表（含权重摘要） |
 | POST | `/api/model` | 切换现行模型 `{"version": "v2"}` |
-| GET | `/api/state` | 工作器指标、按版本统计、最近批次、最近任务 |
-| POST | `/api/jobs` | 异步提交（202），返回任务与接单进度 |
-| GET | `/api/jobs/{id}` | 任务结果 |
-| POST | `/api/classify` | 同步提交并等待结果（脚本/自测用） |
+| GET | `/api/state` | 工作器指标、接单名额快照、按版本统计、最近批次、最近任务 |
+| POST | `/api/jobs` | 异步提交（202），返回任务与逐封接单进度 |
+| GET | `/api/jobs/{id}` | 任务结果（含逐封 `admission`） |
+| POST | `/api/classify` | 同步提交并等待结果，与异步共用接单名额 |
 | GET | `/api/batches` | 最近批次记录 |
 | POST | `/api/demo/interleaved` | 一键交错演示：v1 接单 → 切 v2 → 新请求 + 慢推理 |
 
@@ -92,7 +99,8 @@ NumPy，网关与测试结果逐位一致。
 
 `submit_after_ms`（0–5000）与 `simulate_latency_ms`（0–5000）是演示用：前者错峰接单，
 后者模拟慢推理，用来观察「批次执行中超时 + 迟到结果丢弃」。二者只影响时点，不改变批处理
-契约。
+契约。注意 `submit_after_ms` 决定的是 **申请名额的时刻**：错峰提交如果在那一刻名额已满，
+该封邮件就会被拒单。
 
 ## 调度语义细节
 
@@ -104,9 +112,31 @@ NumPy，网关与测试结果逐位一致。
   `late_results_discarded` 标记，**不会** 把 `timeout` 改回 `ok`。
 - 批内并发打分，因此单封慢邮件不会拖住同批其他邮件；每封各自按自己的截止时间返回。
 
+## 接单名额（全局 8 封）
+
+- 名额是 **每封邮件** 一个，池子全局唯一：`POST /api/jobs` 与 `POST /api/classify` 共用。
+- 接单判定在入队之前同步完成，因此并发提交不会超卖。拿不到名额的邮件得到
+  `status="rejected"` / `reason="admission_overloaded"`，**不会** 创建队列项、不会进入任何批次，
+  也不计入 `submitted`；它单独计入 `rejected_total`。
+- 名额何时释放：
+  - 仍在排队时到期：定时器解析为 `timeout` 并立即释放；
+  - 已派发执行：名额转为 `executing` 并一直持有到 **真实打分调用返回**。即使调用方已经拿到
+    `timeout`（截止时间先到、迟到结果被丢弃），不可中断的打分线程仍占着名额，计算结束后才可接新单。
+- `GET /api/state` 的 `admission` 字段：
+
+  | 字段 | 含义 |
+  | --- | --- |
+  | `limit` / `used` / `available` | 上限、当前占用、剩余可接 |
+  | `queued` / `executing` | 排队中 / 执行中的名额占用 |
+  | `timed_out_still_executing` | 已报超时但打分仍在运行、仍占名额的数量 |
+  | `admitted_total` / `rejected_total` | 进程内累计接单 / 累计拒单 |
+
 ## 已知限制
 
 - 状态全部在进程内（单工作器要求），重启会丢失进行中的任务与切换历史；没有持久化。
 - 模型产物是仓库内预置的两份静态 JSON，没有训练流水线；切换只改指针，不做热加载校验。
 - 演示用的 `simulate_latency_ms` 通过 `asyncio.to_thread` 中的 `sleep` 模拟，结束的线程
-  不会被强制中断（Python 线程无法抢占），只是其结果被丢弃。
+  不会被强制中断（Python 线程无法抢占），只是其结果被丢弃。因此「超时但仍占名额」的时长等于
+  该线程真实跑完的时长；这是有意的限流行为，不是泄漏。
+- 接单上限默认 8，可用 `MAX_ADMITTED_EMAILS` 调整；单次提交上限仍是 16 封（`MAX_EMAILS_PER_SUBMISSION`），
+  当上限小于提交量时，同一提交的邮件会逐封被拒。

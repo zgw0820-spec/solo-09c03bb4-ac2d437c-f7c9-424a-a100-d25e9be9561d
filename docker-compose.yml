@@ -14,6 +14,7 @@ services:
       BATCH_WAIT_MS: "200"
       DISPATCH_GUARD_MS: "25"
       MAX_EMAILS_PER_SUBMISSION: "16"
+      MAX_ADMITTED_EMAILS: "8"
       LOG_LEVEL: INFO
     volumes:
       # Two distinct English bag-of-words models are baked into the image and

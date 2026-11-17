@@ -20,6 +20,13 @@ Contract implemented here
   If scoring finishes after that deadline the request stays a timeout; a late
   prediction is discarded and can never flip it to success.  The other
   requests in the batch resolve independently against their own deadlines.
+* Admission is a global, per-email lease pool (default 8).  Every submission
+  path -- synchronous or asynchronous -- must obtain a lease before a request
+  enters a model queue.  A rejected request never becomes a ``WorkItem`` and
+  never reaches a batch.  Queued requests release their lease when they expire.
+  Executing requests release it only when the actual scoring call has finished;
+  an early timeout result is reported immediately but the non-interruptible
+  scoring thread keeps holding its lease until it really returns.
 """
 
 from __future__ import annotations
@@ -67,6 +74,26 @@ class WorkItem:
     batch_id: str | None = None
     result: dict | None = None
     timer: asyncio.TimerHandle | None = None
+    # Admission lease.  ``queued`` -> ``executing`` keeps the same slot;
+    # ``none`` means the slot has been returned to the global pool.
+    lease_state: str = "none"  # none | queued | executing
+    compute_done: bool = False
+
+
+@dataclass(frozen=True)
+class Admission:
+    """Outcome of intake for one email.
+
+    ``rejected`` is set when the global admission pool is full; in that case
+    the request never became a queue entry.
+    """
+
+    item: WorkItem
+    rejected: dict | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.rejected is None
 
 
 class Worker:
@@ -81,13 +108,17 @@ class Worker:
         dispatch_guard_ms: float = 25.0,
         scorer: Scorer | None = None,
         history_limit: int = 200,
+        max_admitted: int = 8,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be >= 1")
+        if max_admitted < 1:
+            raise ValueError("max_admitted must be >= 1")
         if batch_wait_ms < 0 or dispatch_guard_ms < 0:
             raise ValueError("wait/guard durations must be non-negative")
         self.registry = registry
         self.max_batch_size = int(max_batch_size)
+        self.max_admitted = int(max_admitted)
         self.batch_wait_s = float(batch_wait_ms) / 1000.0
         self.dispatch_guard_s = float(dispatch_guard_ms) / 1000.0
         self._scorer: Scorer = scorer or (lambda model, text: model.predict(text))
@@ -95,12 +126,22 @@ class Worker:
 
         self._queues: dict[str, list[WorkItem]] = {}
         self._inflight: list[WorkItem] = []
+        self._items: list[WorkItem] = []
         self._batch_tasks: set[asyncio.Task] = set()
+        self._scoring_tasks: dict[int, asyncio.Task] = {}
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._closing = False
         self._seq = itertools.count(1)
         self._batch_seq = itertools.count(1)
+
+        # Admission accounting.  ``_used_leases`` is authoritative; the lists
+        # only drive introspection and metrics.
+        self._used_leases = 0
+        self._queued_leases = 0
+        self._executing_leases = 0
+        self._admitted = 0
+        self._rejected = 0
 
         self.metrics: dict[str, int] = {
             "submitted": 0,
@@ -109,6 +150,7 @@ class Worker:
             "errored": 0,
             "batches": 0,
             "late_results_discarded": 0,
+            "admission_rejected": 0,
         }
         self.metrics_by_version: dict[str, dict[str, int]] = {}
         self._batches: list[dict] = []
@@ -126,10 +168,11 @@ class Worker:
         self._batch_tasks.clear()
         self._task = asyncio.create_task(self._run(), name="moderation-worker")
         logger.info(
-            "worker started (max_batch=%d, wait=%.0fms, guard=%.0fms)",
+            "worker started (max_batch=%d, wait=%.0fms, guard=%.0fms, admitted<=%d)",
             self.max_batch_size,
             self.batch_wait_s * 1000,
             self.dispatch_guard_s * 1000,
+            self.max_admitted,
         )
 
     async def stop(self) -> None:
@@ -146,6 +189,15 @@ class Worker:
         if self._batch_tasks:
             await asyncio.gather(*self._batch_tasks, return_exceptions=True)
             self._batch_tasks.clear()
+        # Scoring work that outlived its caller (reported timeout) is still
+        # holding slots.  Stop it now rather than leaking tasks past shutdown.
+        for work in list(self._scoring_tasks.values()):
+            work.cancel()
+        if self._scoring_tasks:
+            await asyncio.gather(
+                *self._scoring_tasks.values(), return_exceptions=True
+            )
+            self._scoring_tasks.clear()
         for item in self._unresolved():
             if item.phase == "executing":
                 self._finalize(
@@ -162,6 +214,14 @@ class Worker:
                     ),
                 )
         self._inflight.clear()
+        self._items = [item for item in self._items if not item.resolved]
+        self._used_leases = sum(1 for item in self._items if item.lease_state != "none")
+        self._queued_leases = sum(
+            1 for item in self._items if item.lease_state == "queued"
+        )
+        self._executing_leases = sum(
+            1 for item in self._items if item.lease_state == "executing"
+        )
         logger.info("worker stopped")
 
     def _unresolved(self) -> list[WorkItem]:
@@ -174,7 +234,7 @@ class Worker:
     # ------------------------------------------------------------------
     # submission
     # ------------------------------------------------------------------
-    async def submit(
+    def new_item(
         self,
         *,
         text: str,
@@ -183,17 +243,16 @@ class Worker:
         request_id: str,
         request_batch_id: str,
         latency_sim_ms: int = 0,
-    ) -> dict:
-        """Enqueue one request and wait for its (possibly timeout) result."""
+    ) -> WorkItem:
+        """Build a request record without admitting it yet."""
         # Validate eagerly so a caller cannot pin an unknown model and the
         # timeout cannot be shorter/longer than the supported envelope.
         self.registry.get(model_version)
         if not 100 <= int(deadline_ms) <= 1000:
             raise ValueError("deadline_ms must be within [100, 1000]")
-
         loop = asyncio.get_running_loop()
         now = time.monotonic()
-        item = WorkItem(
+        return WorkItem(
             request_id=request_id,
             text=text,
             model_version=model_version,
@@ -207,12 +266,152 @@ class Worker:
             future=loop.create_future(),
             simulated_latency_s=max(0.0, float(latency_sim_ms)) / 1000.0,
         )
-        self._queues.setdefault(model_version, []).append(item)
-        item.timer = loop.call_later(deadline_ms / 1000.0, self._on_deadline, item)
+
+    def admit(self, item: WorkItem) -> Admission:
+        """Try to take one global slot and, if granted, enqueue the item.
+
+        This is synchronous on purpose: the decision is made at the instant of
+        intake and the caller learns ``accepted`` / ``rejected`` immediately.
+        A rejected item is never appended to a model queue.
+        """
+        if not self._acquire(item):
+            self._rejected += 1
+            self.metrics["admission_rejected"] += 1
+            return Admission(item=item, rejected=self._build_rejected(item))
+        self._items.append(item)
+        self._admitted += 1
+        self._queues.setdefault(item.model_version, []).append(item)
+        item.timer = asyncio.get_running_loop().call_later(
+            item.deadline_ms / 1000.0, self._on_deadline, item
+        )
         self.metrics["submitted"] += 1
-        self.metrics_by_version.setdefault(model_version, _empty_counts())["submitted"] += 1
+        self.metrics_by_version.setdefault(
+            item.model_version, _empty_counts()
+        )["submitted"] += 1
         self._wake.set()
-        return await item.future
+        return Admission(item=item)
+
+    async def submit(
+        self,
+        *,
+        text: str,
+        model_version: str,
+        deadline_ms: int,
+        request_id: str,
+        request_batch_id: str,
+        latency_sim_ms: int = 0,
+    ) -> dict:
+        """Enqueue one request and wait for its (possibly timeout) result."""
+        admission = self.admit(
+            self.new_item(
+                text=text,
+                model_version=model_version,
+                deadline_ms=deadline_ms,
+                request_id=request_id,
+                request_batch_id=request_batch_id,
+                latency_sim_ms=latency_sim_ms,
+            )
+        )
+        if admission.rejected is not None:
+            return admission.rejected
+        return await admission.item.future
+
+    # ------------------------------------------------------------------
+    # admission leases
+    # ------------------------------------------------------------------
+    def _acquire(self, item: WorkItem) -> bool:
+        """Claim one global admission slot for ``item`` (synchronous, atomic)."""
+        if self._used_leases >= self.max_admitted:
+            return False
+        self._used_leases += 1
+        self._queued_leases += 1
+        item.lease_state = "queued"
+        return True
+
+    def _release_lease(self, item: WorkItem) -> None:
+        """Return an admission slot to the pool exactly once per item."""
+        if item.lease_state == "none":
+            return
+        was_executing = item.lease_state == "executing"
+        item.lease_state = "none"
+        self._used_leases = max(0, self._used_leases - 1)
+        if was_executing:
+            self._executing_leases = max(0, self._executing_leases - 1)
+        else:
+            self._queued_leases = max(0, self._queued_leases - 1)
+        self._prune_items()
+
+    def _mark_executing(self, item: WorkItem) -> None:
+        """Transition the held lease from the queue to in-flight execution."""
+        if item.lease_state == "queued":
+            item.lease_state = "executing"
+            self._queued_leases = max(0, self._queued_leases - 1)
+            self._executing_leases += 1
+
+    def _prune_items(self) -> None:
+        """Forget settled items once their scoring work (if any) is done."""
+        # A resolved item still holding an executing lease has a scoring thread
+        # running; keep it visible until that call returns and releases it.
+        self._items = [
+            item for item in self._items if not item.resolved or item.lease_state == "executing"
+        ]
+
+    def _build_rejected(self, item: WorkItem) -> dict:
+        """Result for a request refused at intake.
+
+        It has no batch id and is deliberately *not* counted as ``submitted``:
+        it never entered the model queue and must not look like accepted work.
+        """
+        return {
+            "request_id": item.request_id,
+            "request_batch_id": item.request_batch_id,
+            "batch_id": None,
+            "model_version": None,
+            "status": "rejected",
+            "reason": "admission_overloaded",
+            "score": None,
+            "label": None,
+            "threshold": None,
+            "deadline_ms": item.deadline_ms,
+            "latency_ms": 0.0,
+            "phase": "resolved",
+            "late_result_discarded": False,
+            "submitted_at": None,
+            "completed_at": _iso_now(),
+        }
+
+    def admission_snapshot(self) -> dict:
+        held_after_timeout = sum(
+            1
+            for item in self._items
+            if item.lease_state == "executing" and item.resolved
+        )
+        return {
+            "limit": self.max_admitted,
+            "used": self._used_leases,
+            "available": max(0, self.max_admitted - self._used_leases),
+            "queued": self._queued_leases,
+            "executing": self._executing_leases,
+            "timed_out_still_executing": held_after_timeout,
+            "admitted_total": self._admitted,
+            "rejected_total": self._rejected,
+        }
+
+    def reset_admission(self) -> None:
+        """Reset admission bookkeeping for a process that has gone idle.
+
+        Used by tests between app lifespans.  Only safe when nothing is queued
+        or executing; counters are recomputed from live items afterwards.
+        """
+        self._prune_items()
+        self._used_leases = sum(1 for item in self._items if item.lease_state != "none")
+        self._queued_leases = sum(1 for item in self._items if item.lease_state == "queued")
+        self._executing_leases = sum(
+            1 for item in self._items if item.lease_state == "executing"
+        )
+        self._admitted = 0
+        self._rejected = 0
+        self.metrics["admission_rejected"] = 0
 
     # ------------------------------------------------------------------
     # worker loop
@@ -315,18 +514,14 @@ class Worker:
                     self._remove(item)
                     continue
                 if now >= item.deadline:
-                    reason = (
-                        "deadline_exceeded_during_batch"
-                        if item.phase == "executing"
-                        else "deadline_exceeded_before_dispatch"
-                    )
+                    # Expiry while still queued: the admission slot is returned
+                    # here, so a timed-out queued email cannot block intake.
                     self._finalize(
                         item,
                         self._build_result(
                             item,
                             status="timeout",
-                            reason=reason,
-                            batch_id=item.batch_id,
+                            reason="deadline_exceeded_before_dispatch",
                         ),
                     )
 
@@ -341,6 +536,9 @@ class Worker:
                 self._queues.pop(item.model_version, None)
         if item in self._inflight:
             self._inflight.remove(item)
+        # Lease release is deliberately not decided here: a queued item gives
+        # its slot back, while an executing item keeps it until its scoring
+        # call returns (see ``_compute_finished``).
 
     # ------------------------------------------------------------------
     # execution
@@ -354,12 +552,18 @@ class Worker:
         enforces each item's deadline itself (via ``asyncio.wait_for`` plus an
         explicit post-check).  Keeping the timer alive would race the batch
         and make the result ambiguous.
+
+        The admission lease is *not* released here: it transitions from
+        ``queued`` to ``executing`` and stays held until the scoring call
+        actually returns, even if the caller is answered with a timeout first.
         """
         reserved: list[WorkItem] = []
         for item in candidates:
             if item.resolved or item.future.done():
                 self._remove(item)
                 continue
+            # Queue -> executing: the slot is retained, not released.
+            self._mark_executing(item)
             self._remove(item)
             if item.timer is not None:
                 item.timer.cancel()
@@ -505,12 +709,31 @@ class Worker:
         )
 
     async def _score_call(self, item: WorkItem, model: LinearBoWModel):
+        # The scoring call (plus its demo latency) is wrapped in its own task so
+        # that a deadline can answer the caller without cancelling the actual
+        # work.  The admission lease is returned by the done-callback when the
+        # work really finishes -- a reported timeout does not free the slot
+        # while the non-interruptible thread is still scoring.
+        work = asyncio.ensure_future(self._scoring_work(item, model))
+        # WorkItem is a mutable dataclass, so key by identity.
+        self._scoring_tasks[id(item)] = work
+        work.add_done_callback(lambda task: self._compute_finished(item, task))
+        return await asyncio.shield(work)
+
+    async def _scoring_work(self, item: WorkItem, model: LinearBoWModel):
         prediction = await asyncio.to_thread(self._scorer, model, item.text)
         if item.simulated_latency_s > 0:
             # Demo-only: emulate a slow inference call.  The deadline timer
             # and wait_for above still fire on schedule.
             await asyncio.sleep(item.simulated_latency_s)
         return prediction
+
+    def _compute_finished(self, item: WorkItem, task: asyncio.Task) -> None:
+        item.compute_done = True
+        self._scoring_tasks.pop(id(item), None)
+        if not task.cancelled():
+            task.exception()  # mark retrieved; a late failure is not actionable
+        self._release_lease(item)
 
     @staticmethod
     def _history_item(result: dict) -> dict:
@@ -581,6 +804,11 @@ class Worker:
             item.timer.cancel()
             item.timer = None
         self._remove(item)
+        if item.lease_state == "queued":
+            # Never dispatched (expired / stopped): return the slot now.
+            self._release_lease(item)
+        else:
+            self._prune_items()
         if result["status"] == "ok":
             self.metrics["completed_ok"] += 1
         elif result["status"] == "timeout":
@@ -600,6 +828,7 @@ class Worker:
     # introspection
     # ------------------------------------------------------------------
     def pending_count(self, version: str | None = None) -> int:
+        """Accepted emails still holding a slot (queued or truly executing)."""
         pending = self._unresolved()
         if version is None:
             return len(pending)
@@ -626,6 +855,7 @@ class Worker:
         return {
             "pending": len(pending),
             "pending_by_version": by_version,
+            "admission": self.admission_snapshot(),
             "max_batch_size": self.max_batch_size,
             "batch_wait_ms": round(self.batch_wait_s * 1000, 3),
             "dispatch_guard_ms": round(self.dispatch_guard_s * 1000, 3),

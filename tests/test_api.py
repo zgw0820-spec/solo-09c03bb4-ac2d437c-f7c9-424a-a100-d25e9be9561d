@@ -23,8 +23,22 @@ def client():
     main_module.worker.metrics.update(
         {key: 0 for key in main_module.worker.metrics}
     )
+    main_module.worker.reset_admission()
     with TestClient(main_module.app) as test_client:
         yield test_client
+
+
+def _wait(client, job_id: str, timeout: float = 8.0) -> dict:
+    import time
+
+    deadline = time.monotonic() + timeout
+    state = {}
+    while time.monotonic() < deadline:
+        state = client.get(f"/api/jobs/{job_id}").json()
+        if state["status"] in ("completed", "failed"):
+            return state
+        time.sleep(0.01)
+    return state
 
 
 def test_health_and_models(client):
@@ -37,6 +51,117 @@ def test_health_and_models(client):
     assert len(models["models"]) == 2
     v1, v2 = {m["version"]: m for m in models["models"]}.values()
     assert v1["vocabulary_size"] != v2["vocabulary_size"]
+
+
+# ---------------------------------------------------------------------------
+# global admission cap (8 emails, shared by sync and async submissions)
+# ---------------------------------------------------------------------------
+def test_admission_cap_shared_by_async_and_sync(client):
+    """Eight slots total; later emails are rejected per email, never queued."""
+    client.post("/api/model", json={"version": "v1"})
+    # Long batching window keeps these eight in the queue while we probe.
+    blocker = client.post(
+        "/api/jobs",
+        json={
+            "label": "fills the pool",
+            "emails": [
+                {"text": f"free spam {i}", "deadline_ms": 1000,
+                 "simulate_latency_ms": 900}
+                for i in range(8)
+            ],
+        },
+    ).json()
+    assert blocker["size"] == 8
+
+    # The synchronous path shares the same pool and must be refused too.
+    sync = client.post(
+        "/api/classify",
+        json={"label": "sync", "emails": [{"text": "free spam", "deadline_ms": 1000}]},
+    ).json()
+    assert sync["entries"][0]["status"] == "rejected"
+    assert sync["entries"][0]["reason"] == "admission_overloaded"
+    assert sync["entries"][0]["model_version"] is None
+    assert sync["entries"][0]["batch_id"] is None
+    assert sync["rejected"] == 1 and sync["accepted"] == 0
+
+    # The async path reports rejection per email as well.
+    async_probe = client.post(
+        "/api/jobs",
+        json={
+            "label": "async",
+            "emails": [{"text": "free spam", "deadline_ms": 1000}],
+        },
+    ).json()
+    state = _wait(client, async_probe["id"], timeout=3)
+    entry = state["entries"][0]
+    assert entry["admission"] == "rejected"
+    assert entry["status"] == "rejected"
+
+    snapshot = client.get("/api/state").json()["admission"]
+    assert snapshot["limit"] == 8
+    assert snapshot["rejected_total"] >= 2
+    assert snapshot["used"] <= 8
+
+    # No batch may contain a rejected request id.
+    rejected_ids = {
+        e["request_id"] for e in sync["entries"] if e["status"] == "rejected"
+    } | {entry["request_id"]}
+    for batch in client.get("/api/batches?limit=50").json()["batches"]:
+        assert not (rejected_ids & set(batch["request_ids"]))
+
+
+def test_admission_state_exposed(client):
+    state = client.get("/api/state").json()
+    assert state["config"]["max_admitted_emails"] == 8
+    admission = state["admission"]
+    for key in ("limit", "used", "available", "queued", "executing",
+                "admitted_total", "rejected_total"):
+        assert key in admission
+    assert admission["limit"] == 8
+
+
+def test_admission_slots_return_after_queue_expiry(client):
+    """Queued emails that expire while the worker is busy free their slots."""
+    client.post("/api/model", json={"version": "v1"})
+    # 4 slow-executing emails occupy the worker; 4 more fill the pool.
+    client.post(
+        "/api/jobs",
+        json={
+            "label": "slow",
+            "emails": [
+                {"text": f"free spam {i}", "deadline_ms": 1000,
+                 "simulate_latency_ms": 800}
+                for i in range(8)
+            ],
+        },
+    )
+    probe = client.post(
+        "/api/jobs",
+        json={"label": "probe", "emails": [{"text": "free spam", "deadline_ms": 200}]},
+    ).json()
+    probe_state = _wait(client, probe["id"], timeout=4)
+    assert probe_state["entries"][0]["admission"] == "rejected"
+
+    # Only short deadlines are left behind: re-probing must eventually be
+    # admitted once the earlier emails have settled and released their slots.
+    import time
+
+    deadline = time.monotonic() + 8.0
+    admitted = False
+    while time.monotonic() < deadline:
+        again = client.post(
+            "/api/classify",
+            json={
+                "label": "again",
+                "emails": [{"text": "free spam", "deadline_ms": 1000}],
+            },
+        ).json()
+        if again["entries"][0]["status"] != "rejected":
+            admitted = True
+            break
+        time.sleep(0.05)
+    assert admitted, "slots were never released"
+    assert client.get("/api/state").json()["admission"]["rejected_total"] >= 1
 
 
 def test_switch_model_endpoint(client):

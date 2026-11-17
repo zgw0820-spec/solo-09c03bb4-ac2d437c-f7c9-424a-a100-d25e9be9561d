@@ -75,7 +75,11 @@ async def test_batch_waits_until_window_or_full():
 
 @pytest.mark.asyncio
 async def test_sixteen_emails_group_into_batches_of_four():
-    worker = Worker(make_registry(), max_batch_size=4, batch_wait_ms=5)
+    # This test is about batch packing, not intake admission: allow enough
+    # slots for all 16 requests to be queued at once.
+    worker = Worker(
+        make_registry(), max_batch_size=4, batch_wait_ms=5, max_admitted=16
+    )
     await worker.start()
     try:
         jobs = [
@@ -180,7 +184,9 @@ async def test_batches_never_mix_versions():
 
 @pytest.mark.asyncio
 async def test_batch_capped_at_four():
-    worker = Worker(make_registry(), max_batch_size=4, batch_wait_ms=20)
+    worker = Worker(
+        make_registry(), max_batch_size=4, batch_wait_ms=20, max_admitted=9
+    )
     await worker.start()
     try:
         jobs = [

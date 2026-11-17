@@ -73,10 +73,21 @@ function statusPill(status) {
     ok: ["ok", "成功"],
     timeout: ["timeout", "超时"],
     error: ["error", "错误"],
+    rejected: ["rejected", "过载拒单"],
     accepted: ["pending", "已接单"],
     queued: ["pending", "排队"],
   };
   const [cls, label] = map[status] || ["pending", status || "—"];
+  return el("span", `pill ${cls}`, label);
+}
+
+function admissionPill(admission) {
+  const map = {
+    accepted: ["ok", "已接单"],
+    rejected: ["rejected", "过载拒单"],
+    pending: ["pending", "待接单"],
+  };
+  const [cls, label] = map[admission] || ["pending", admission || "—"];
   return el("span", `pill ${cls}`, label);
 }
 
@@ -261,32 +272,44 @@ async function refreshState() {
   state.active = data.active_model;
   updateActiveBadge(data.active_model);
   const worker = data.worker;
+  const admission = data.admission || worker.admission || {};
   $("#pending-badge").textContent = `队列 ${worker.pending}`;
+  const admissionBadge = $("#admission-badge");
+  if (admissionBadge) {
+    admissionBadge.textContent = `接单 ${admission.used ?? 0}/${admission.limit ?? 8} · 拒单 ${admission.rejected_total ?? 0}`;
+    admissionBadge.className =
+      "badge" + (admission.available === 0 ? " bad" : admission.used > 0 ? " warn" : "");
+  }
   $("#worker-config").textContent =
-    `批 ≤${worker.max_batch_size} · 等待 ≤${worker.batch_wait_ms}ms · 提前 ${worker.dispatch_guard_ms}ms`;
+    `批 ≤${worker.max_batch_size} · 等待 ≤${worker.batch_wait_ms}ms · 提前 ${worker.dispatch_guard_ms}ms · 接单 ≤${admission.limit ?? 8}`;
 
-  renderMetrics(worker);
+  renderMetrics(worker, admission);
   renderVersionMetrics(worker);
   renderBatches(worker.recent_batches);
 }
 
-function renderMetrics(worker) {
+function renderMetrics(worker, admission = {}) {
   const box = $("#metrics");
   box.textContent = "";
   const metrics = worker.metrics;
   const entries = [
     ["已接单", metrics.submitted],
+    ["占用名额", `${admission.used ?? 0}/${admission.limit ?? 8}`],
+    ["执行中", admission.executing ?? 0],
+    ["超时仍占", admission.timed_out_still_executing ?? 0],
+    ["排队中", admission.queued ?? 0],
+    ["拒单", admission.rejected_total ?? 0],
     ["成功", metrics.completed_ok],
     ["超时", metrics.timed_out],
     ["错误", metrics.errored],
     ["批次数", metrics.batches],
     ["迟到丢弃", metrics.late_results_discarded],
-    ["排队中", worker.pending],
   ];
   for (const [key, value] of entries) {
     const card = el("div", "metric");
     card.append(el("div", "k", key));
     card.append(el("div", "v", String(value ?? 0)));
+    if (key === "超时仍占" && Number(value) > 0) card.classList.add("warn");
     box.append(card);
   }
 }
@@ -350,6 +373,9 @@ function buildJobCard(job) {
   );
   head.append(el("span", "spacer"));
   for (const version of job.versions || []) head.append(versionPill(version));
+  if (job.rejected) {
+    head.append(el("span", "pill rejected", `拒单 ${job.rejected}`));
+  }
   head.append(el("span", "small muted", `成功 ${job.ok} · 超时 ${job.timeouts}`));
   if (job.settled !== undefined) {
     head.append(el("span", "small muted", `${job.settled}/${job.size}`));
@@ -371,8 +397,15 @@ function buildJobCard(job) {
       const label =
         event.type === "model_switched"
           ? `切换 ${event.from}→${event.to} @${event.at.slice(11, 19)}`
+          : event.type === "rejected"
+          ? `拒单 #${event.index}（过载）@${event.at.slice(11, 19)}`
           : `接单 #${event.index} → ${event.model_version} @${event.at.slice(11, 19)}`;
-      const cls = event.type === "model_switched" ? "event switch" : "event";
+      const cls =
+        event.type === "model_switched"
+          ? "event switch"
+          : event.type === "rejected"
+          ? "event reject"
+          : "event";
       const node = el("span", cls, label);
       if (event.pending_old !== undefined) {
         node.textContent += ` (旧版排队 ${event.pending_old})`;
@@ -389,6 +422,7 @@ function buildJobCard(job) {
     "#",
     "正文",
     "截止",
+    "接单",
     "状态",
     "分数",
     "分类",
@@ -407,12 +441,14 @@ function buildJobCard(job) {
   if (!entries.length) {
     const tr = el("tr");
     const td = el("td", "empty", "结果加载中…");
-    td.colSpan = 10;
+    td.colSpan = 11;
     tr.append(td);
     tbody.append(tr);
   }
   for (const entry of entries) {
-    const tr = el("tr");
+    const admitted = entry.admission || "pending";
+    const rejected = admitted === "rejected";
+    const tr = el("tr", rejected ? "rejected-row" : null);
     tr.append(el("td", "num", String(entry.index)));
     const textCell = el("td", "text");
     const clamp = el("div", "clamp", entry.text);
@@ -420,8 +456,12 @@ function buildJobCard(job) {
     textCell.append(clamp);
     tr.append(textCell);
     tr.append(el("td", "num", `${entry.deadline_ms}ms`));
+    const admissionCell = el("td");
+    admissionCell.append(admissionPill(admitted));
+    tr.append(admissionCell);
     const statusCell = el("td");
-    statusCell.append(statusPill(entry.status));
+    const showStatus = entry.status && !["accepted", "rejected"].includes(entry.status);
+    statusCell.append(showStatus ? statusPill(entry.status) : el("span", "muted", "—"));
     tr.append(statusCell);
     tr.append(el("td", "num", fmt(entry.score, 4)));
     const labelCell = el("td");
@@ -437,10 +477,11 @@ function buildJobCard(job) {
     versionCell.append(versionPill(entry.model_version));
     tr.append(versionCell);
     tr.append(el("td", "mono small", entry.batch_id || "—"));
-    tr.append(el("td", "num", entry.latency_ms === null || entry.latency_ms === undefined ? "—" : `${fmt(entry.latency_ms, 1)}ms`));
+    tr.append(el("td", "num", entry.latency_ms === null || entry.latency_ms === undefined || rejected ? "—" : `${fmt(entry.latency_ms, 1)}ms`));
     const noteCell = el("td", "small muted");
     const notes = [];
-    if (entry.reason) notes.push(entry.reason);
+    if (entry.reason === "admission_overloaded") notes.push("接单已满，未进入模型队列");
+    else if (entry.reason) notes.push(entry.reason);
     if (entry.late_result_discarded) notes.push("迟到结果已丢弃");
     if (entry.simulate_latency_ms) notes.push(`模拟延迟 ${entry.simulate_latency_ms}ms`);
     if (entry.submit_after_ms) notes.push(`错峰 ${entry.submit_after_ms}ms`);
@@ -499,7 +540,14 @@ async function submitEmails() {
       body: JSON.stringify({ label: `手工提交 · ${emails.length} 封`, emails }),
     });
     state.expanded.add(job.id);
-    toast(`已接单 ${job.size} 封，批次与版本见右侧`);
+    const accepted = job.accepted ?? job.size;
+    const rejected = job.rejected ?? 0;
+    toast(
+      rejected
+        ? `已接单 ${accepted} 封，过载拒单 ${rejected} 封（未进入模型队列）`
+        : `已接单 ${accepted} 封，批次与版本见右侧`,
+      rejected > 0
+    );
     await refreshJobs(true);
     await refreshState();
   } catch (error) {

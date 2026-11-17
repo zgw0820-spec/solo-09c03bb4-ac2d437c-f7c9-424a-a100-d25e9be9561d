@@ -41,6 +41,10 @@ MAX_EMAILS_PER_SUBMISSION = int(os.environ.get("MAX_EMAILS_PER_SUBMISSION", "16"
 DEADLINE_MIN_MS = 100
 DEADLINE_MAX_MS = 1000
 MAX_JOBS_KEPT = int(os.environ.get("MAX_JOBS_KEPT", "30"))
+# Global intake cap shared by synchronous and asynchronous submissions.  A
+# slot is held from acceptance until the email's scoring call has really
+# finished (a timeout answer alone does not free it).
+MAX_ADMITTED_EMAILS = int(os.environ.get("MAX_ADMITTED_EMAILS", "8"))
 
 registry = ModelRegistry.load_dir(MODELS_DIR, os.environ.get("DEFAULT_MODEL_VERSION"))
 worker = Worker(
@@ -48,6 +52,7 @@ worker = Worker(
     max_batch_size=int(os.environ.get("MAX_BATCH_SIZE", "4")),
     batch_wait_ms=float(os.environ.get("BATCH_WAIT_MS", "200")),
     dispatch_guard_ms=float(os.environ.get("DISPATCH_GUARD_MS", "25")),
+    max_admitted=MAX_ADMITTED_EMAILS,
 )
 
 active_version: str = registry.default_version
@@ -123,6 +128,7 @@ class JobEntry:
     simulate_latency_ms: int
     model_version: str | None = None
     accepted_at: str | None = None
+    admitted: str | None = None  # accepted | rejected (decided at intake)
     result: dict | None = None
 
     def public(self) -> dict:
@@ -135,6 +141,7 @@ class JobEntry:
             "simulate_latency_ms": self.simulate_latency_ms,
             "model_version": self.model_version,
             "accepted_at": self.accepted_at,
+            "admission": self.admitted or "pending",
             "status": result.get("status", "accepted"),
             "score": result.get("score"),
             "label": result.get("label"),
@@ -173,6 +180,9 @@ class Job:
             "error": self.error,
             "events": list(self.events),
             "size": len(self.entries),
+            "accepted": sum(1 for e in self.entries if e.admitted == "accepted"),
+            "rejected": sum(1 for e in self.entries if e.admitted == "rejected"),
+            "pending_admission": sum(1 for e in self.entries if e.admitted is None),
             "settled": sum(1 for e in self.entries if e.result is not None),
             "ok": sum(1 for e in self.entries if (e.result or {}).get("status") == "ok"),
             "timeouts": sum(
@@ -196,47 +206,98 @@ def _prune_jobs() -> None:
         jobs.pop(jid, None)
 
 
+async def _intake_entry(job: Job, entry: JobEntry, *, submit_at: float):
+    """Admit one email at its scheduled moment and record the decision.
+
+    Returns ``(entry, future)`` when accepted, or ``(entry, None)`` when the
+    global admission pool refused it.  A rejected email never reaches the
+    model queue and gets its verdict immediately.  The active model is read
+    at the instant of admission, which is why a switch affects only emails
+    admitted after it.
+    """
+    delay = submit_at - time.monotonic()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    # ---- intake: pin the version that is active right now ----
+    version = active_version
+    item = worker.new_item(
+        text=entry.text,
+        model_version=version,
+        deadline_ms=entry.deadline_ms,
+        request_id=f"{job.id}-{entry.index}",
+        request_batch_id=job.id,
+        latency_sim_ms=entry.simulate_latency_ms,
+    )
+    # ---- admission: one global slot per email, decided right now ----
+    admission = worker.admit(item)
+    decided_at = _now_iso()
+    if admission.rejected is not None:
+        entry.admitted = "rejected"
+        entry.result = admission.rejected
+        job.events.append(
+            {
+                "at": decided_at,
+                "type": "rejected",
+                "index": entry.index,
+                "reason": admission.rejected["reason"],
+            }
+        )
+        return entry, None
+    entry.model_version = version
+    entry.accepted_at = decided_at
+    entry.admitted = "accepted"
+    job.events.append(
+        {
+            "at": entry.accepted_at,
+            "type": "accepted",
+            "index": entry.index,
+            "model_version": version,
+        }
+    )
+    return entry, admission.item.future
+
+
 async def _run_job(job: Job) -> None:
     job.status = "running"
     job.started_at = _now_iso()
     start = time.monotonic()
-    tasks: list[asyncio.Task] = []
     try:
-        for entry in job.entries:
-            delay = start + entry.submit_after_ms / 1000.0 - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            # ---- intake: pin the version that is active right now ----
-            version = active_version
-            entry.model_version = version
-            entry.accepted_at = _now_iso()
-            job.events.append(
-                {
-                    "at": entry.accepted_at,
-                    "type": "accepted",
-                    "index": entry.index,
-                    "model_version": version,
-                }
+        # Start every email's intake concurrently.  Each is admitted at its own
+        # scheduled time, so acceptance is decided per email and never depends
+        # on how long another email's inference takes.
+        admissions = await asyncio.gather(
+            *(
+                _intake_entry(
+                    job,
+                    entry,
+                    submit_at=start + entry.submit_after_ms / 1000.0,
+                )
+                for entry in job.entries
+            ),
+            return_exceptions=True,
+        )
+        waiters: list[tuple[JobEntry, asyncio.Future]] = []
+        for outcome in admissions:
+            if isinstance(outcome, BaseException):
+                logger.exception("intake failed for job %s", job.id, exc_info=outcome)
+                continue
+            entry, future = outcome
+            if future is None:
+                continue
+            waiters.append((entry, future))
+        if waiters:
+            settled = await asyncio.gather(
+                *(future for _entry, future in waiters), return_exceptions=True
             )
-            coro = worker.submit(
-                text=entry.text,
-                model_version=version,
-                deadline_ms=entry.deadline_ms,
-                request_id=f"{job.id}-{entry.index}",
-                request_batch_id=job.id,
-                latency_sim_ms=entry.simulate_latency_ms,
-            )
-            tasks.append(asyncio.create_task(coro))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for entry, result in zip(job.entries, results):
-            if isinstance(result, BaseException):
-                entry.result = {
-                    "status": "error",
-                    "reason": "gateway_error",
-                    "detail": str(result),
-                }
-            else:
-                entry.result = result
+            for (entry, _future), result in zip(waiters, settled):
+                if isinstance(result, BaseException):
+                    entry.result = {
+                        "status": "error",
+                        "reason": "gateway_error",
+                        "detail": str(result),
+                    }
+                else:
+                    entry.result = result
         job.status = "completed"
     except asyncio.CancelledError:
         job.status = "cancelled"
@@ -247,6 +308,15 @@ async def _run_job(job: Job) -> None:
         job.status = "failed"
         job.error = str(exc)
     finally:
+        for entry in job.entries:
+            if entry.admitted is None:
+                entry.admitted = "rejected"
+            if entry.result is None:
+                entry.result = {
+                    "status": "error",
+                    "reason": "not_settled",
+                    "detail": "job ended before this email settled",
+                }
         job.finished_at = _now_iso()
         _prune_jobs()
 
@@ -306,7 +376,12 @@ async def index() -> FileResponse:
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"status": "ok", "active_model": active_version, "models": registry.versions}
+    return {
+        "status": "ok",
+        "active_model": active_version,
+        "models": registry.versions,
+        "admission": worker.admission_snapshot(),
+    }
 
 
 @app.get("/api/models")
@@ -352,11 +427,13 @@ async def state() -> dict:
         "models": registry.versions,
         "switches": list(reversed(switches[-20:])),
         "worker": worker.snapshot(),
+        "admission": worker.admission_snapshot(),
         "config": {
             "max_batch_size": worker.max_batch_size,
             "batch_wait_ms": worker.batch_wait_s * 1000,
             "dispatch_guard_ms": worker.dispatch_guard_s * 1000,
             "max_emails_per_submission": MAX_EMAILS_PER_SUBMISSION,
+            "max_admitted_emails": MAX_ADMITTED_EMAILS,
             "deadline_min_ms": DEADLINE_MIN_MS,
             "deadline_max_ms": DEADLINE_MAX_MS,
         },
@@ -446,32 +523,46 @@ async def demo_interleaved() -> dict:
         job.status = "running"
         job.started_at = _now_iso()
         start = time.monotonic()
-        tasks: list[asyncio.Task] = []
-        try:
-            for entry in job.entries[: len(old_emails)]:
-                version = active_version
-                entry.model_version = version
-                entry.accepted_at = _now_iso()
-                job.events.append(
-                    {
-                        "at": entry.accepted_at,
-                        "type": "accepted",
-                        "index": entry.index,
-                        "model_version": version,
-                    }
-                )
-                tasks.append(
-                    asyncio.create_task(
-                        worker.submit(
-                            text=entry.text,
-                            model_version=version,
-                            deadline_ms=entry.deadline_ms,
-                            request_id=f"{job.id}-{entry.index}",
-                            request_batch_id=job.id,
-                            latency_sim_ms=entry.simulate_latency_ms,
-                        )
+
+        async def admit_range(first: int, last: int):
+            return await asyncio.gather(
+                *(
+                    _intake_entry(
+                        job,
+                        entry,
+                        submit_at=start + 0.0,
                     )
-                )
+                    for entry in job.entries[first:last]
+                ),
+                return_exceptions=True,
+            )
+
+        async def await_admissions(outcomes) -> None:
+            waiters: list[tuple[JobEntry, asyncio.Future]] = []
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    logger.exception("demo intake failed", exc_info=outcome)
+                    continue
+                entry, future = outcome
+                if future is not None:
+                    waiters.append((entry, future))
+            if not waiters:
+                return
+            settled = await asyncio.gather(
+                *(future for _entry, future in waiters), return_exceptions=True
+            )
+            for (entry, _future), result in zip(waiters, settled):
+                if isinstance(result, BaseException):
+                    entry.result = {
+                        "status": "error",
+                        "reason": "gateway_error",
+                        "detail": str(result),
+                    }
+                else:
+                    entry.result = result
+
+        try:
+            outcomes = await admit_range(0, len(old_emails))
             await asyncio.sleep(max(0.0, start + 0.06 - time.monotonic()))
             event = _set_active(
                 "v2", source="demo", note="演示：切换到 v2（旧请求仍在排队）"
@@ -486,46 +577,23 @@ async def demo_interleaved() -> dict:
                 }
             )
             await asyncio.sleep(max(0.0, start + 0.10 - time.monotonic()))
-            for entry in job.entries[len(old_emails) :]:
-                version = active_version
-                entry.model_version = version
-                entry.accepted_at = _now_iso()
-                job.events.append(
-                    {
-                        "at": entry.accepted_at,
-                        "type": "accepted",
-                        "index": entry.index,
-                        "model_version": version,
-                    }
-                )
-                tasks.append(
-                    asyncio.create_task(
-                        worker.submit(
-                            text=entry.text,
-                            model_version=version,
-                            deadline_ms=entry.deadline_ms,
-                            request_id=f"{job.id}-{entry.index}",
-                            request_batch_id=job.id,
-                            latency_sim_ms=entry.simulate_latency_ms,
-                        )
-                    )
-                )
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for entry, result in zip(job.entries, results):
-                if isinstance(result, BaseException):
-                    entry.result = {
-                        "status": "error",
-                        "reason": "gateway_error",
-                        "detail": str(result),
-                    }
-                else:
-                    entry.result = result
+            outcomes += await admit_range(len(old_emails), len(job.entries))
+            await await_admissions(outcomes)
             job.status = "completed"
         except asyncio.CancelledError:
             job.status = "cancelled"
             job.error = "shutdown"
             raise
         finally:
+            for entry in job.entries:
+                if entry.admitted is None:
+                    entry.admitted = "rejected"
+                if entry.result is None:
+                    entry.result = {
+                        "status": "error",
+                        "reason": "not_settled",
+                        "detail": "demo ended before this email settled",
+                    }
             job.finished_at = _now_iso()
             _prune_jobs()
 
